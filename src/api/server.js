@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const config = require('../config');
@@ -31,17 +31,29 @@ async function startServer() {
     await connectDB();
     await defaultQueue.init('api-server');
 
+    // Automatically launch embedded worker pool in local mode
+    const { WorkerProcess } = require('../worker/worker');
+    const workerCount = config.worker.concurrency || 3;
+    console.log(`👷 [Embedded Workers] Spawning ${workerCount} background workers...`);
+    const activeWorkers = [];
+    for (let i = 1; i <= workerCount; i++) {
+      const worker = new WorkerProcess(`worker-#${i}`);
+      activeWorkers.push(worker);
+      worker.start().catch((err) => console.error(`Worker #${i} error:`, err));
+    }
+
     const server = app.listen(config.port, () => {
       console.log(`====================================================`);
-      console.log(`🌐 Distributed Job Queue API Server running!`);
-      console.log(`📍 URL: http://localhost:${config.port}`);
-      console.log(`📊 Live UI Dashboard: http://localhost:${config.port}`);
+      console.log(`🌐 Distributed Job Queue Server & Workers RUNNING!`);
+      console.log(`📍 Dashboard URL: http://localhost:${config.port}`);
+      console.log(`⚡ Concurrency: ${workerCount} Active Concurrent Workers`);
       console.log(`📚 Healthcheck: http://localhost:${config.port}/health`);
       console.log(`====================================================`);
     });
 
     const shutdown = async () => {
-      console.log('\n🛑 Shutting down API server...');
+      console.log('\n🛑 Shutting down API server and workers...');
+      activeWorkers.forEach((w) => (w.isRunning = false));
       server.close();
       await defaultQueue.close();
       process.exit(0);

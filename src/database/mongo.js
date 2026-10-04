@@ -1,4 +1,4 @@
-﻿const mongoose = require('mongoose');
+const mongoose = require('mongoose');
 const config = require('../config');
 
 let isConnected = false;
@@ -28,7 +28,7 @@ async function connectDB() {
 }
 
 function isFallbackMode() {
-  return isUsingFallback;
+  return mongoose.connection.readyState !== 1;
 }
 
 module.exports = {

@@ -1,4 +1,4 @@
-﻿const API_BASE = '/api';
+const API_BASE = '/api';
 let pollInterval = null;
 
 async function fetchMetrics() {
@@ -98,12 +98,37 @@ async function simulateBurst(count = 30) {
   const priorities = ['HIGH', 'MEDIUM', 'LOW'];
 
   for (let i = 0; i < count; i++) {
-    const type = types[Math.floor(Math.random() * types.length)];
     const priority = priorities[Math.floor(Math.random() * priorities.length)];
+    let type = types[Math.floor(Math.random() * (types.length - 1))]; // mostly regular jobs
+    let payload = { index: i, timestamp: Date.now() };
+
+    // 15% chance of transient retry job, 5% chance of permanent failure to test manual retries
+    const rand = Math.random();
+    if (rand < 0.05) {
+      type = 'FAILING_SIMULATION';
+      payload.errorMessage = 'External payment gateway 503 Service Unavailable';
+      payload.succeedOnAttempt = null; // Permanently fails after 3 retries
+    } else if (rand < 0.20) {
+      type = 'FAILING_SIMULATION';
+      payload.errorMessage = 'Transient 3rd party SMTP socket timeout';
+      payload.succeedOnAttempt = 2; // Auto-recovers on 2nd attempt via backoff
+    }
+
+    if (type === 'EMAIL') {
+      payload.to = `burst_user_${i}@example.com`;
+      payload.subject = `Burst Email Notification #${i}`;
+    } else if (type === 'IMAGE_RESIZE') {
+      payload.imageUrl = `https://cdn.example.com/images/asset_${i}.jpg`;
+      payload.dimensions = { width: 800, height: 600 };
+    } else if (type === 'REPORT_GENERATION') {
+      payload.reportType = 'PERFORMANCE_SUMMARY';
+      payload.userId = `user_${i}`;
+    }
+
     jobs.push({
       type,
       priority,
-      payload: { index: i, timestamp: Date.now() },
+      payload,
       maxRetries: 3,
     });
   }
