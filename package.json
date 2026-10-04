@@ -1,0 +1,35 @@
+﻿{
+  "name": "distributed-job-queue",
+  "version": "1.0.0",
+  "description": "Production-grade distributed background job queue built with Node.js, Redis, MongoDB, and Docker",
+  "main": "src/api/server.js",
+  "scripts": {
+    "start": "node src/api/server.js",
+    "start:api": "node src/api/server.js",
+    "start:worker": "node src/worker/worker.js",
+    "start:workers": "node src/worker/workerPool.js",
+    "dev:api": "node --watch src/api/server.js",
+    "dev:worker": "node --watch src/worker/worker.js",
+    "benchmark": "node scripts/benchmark.js",
+    "seed": "node scripts/seedJobs.js"
+  },
+  "keywords": [
+    "distributed-systems",
+    "job-queue",
+    "redis",
+    "mongodb",
+    "nodejs",
+    "priority-queue",
+    "background-processing"
+  ],
+  "author": "Distributed Systems Engineer",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "mongoose": "^8.4.1",
+    "uuid": "^9.0.1"
+  }
+}

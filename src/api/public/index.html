@@ -1,0 +1,175 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Distributed Job Queue Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <div class="logo-badge">⚡</div>
+        <div>
+          <h1>Distributed Job Queue</h1>
+          <p class="subtitle">Node.js · Redis Priority Queue · MongoDB · Worker Pool</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="badge-pulse" id="connectionStatus">● Live Polling</span>
+        <button id="btnRefresh" class="btn btn-secondary">🔄 Refresh</button>
+        <button id="btnClear" class="btn btn-danger">🗑️ Clear Queues</button>
+      </div>
+    </header>
+
+    <!-- Metrics Grid -->
+    <section class="metrics-grid">
+      <div class="card metric-card">
+        <div class="metric-label">Total Jobs</div>
+        <div class="metric-value" id="valTotal">0</div>
+        <div class="metric-sub" id="valSuccessRate">Success Rate: 100%</div>
+      </div>
+
+      <div class="card metric-card">
+        <div class="metric-label">Queue Backlog</div>
+        <div class="metric-value" id="valPending">0</div>
+        <div class="queue-breakdown">
+          <span class="pill pill-high" id="badgeHigh">HIGH: 0</span>
+          <span class="pill pill-med" id="badgeMed">MED: 0</span>
+          <span class="pill pill-low" id="badgeLow">LOW: 0</span>
+        </div>
+      </div>
+
+      <div class="card metric-card">
+        <div class="metric-label">Active Workers</div>
+        <div class="metric-value" id="valProcessing">0</div>
+        <div class="metric-sub" id="valDelayed">Retrying: 0</div>
+      </div>
+
+      <div class="card metric-card">
+        <div class="metric-label">Completed</div>
+        <div class="metric-value text-success" id="valCompleted">0</div>
+        <div class="metric-sub" id="valAvgTime">Avg Time: 0ms</div>
+      </div>
+
+      <div class="card metric-card">
+        <div class="metric-label">Failed</div>
+        <div class="metric-value text-danger" id="valFailed">0</div>
+        <div class="metric-sub" id="valRetries">Auto-Retried</div>
+      </div>
+    </section>
+
+    <!-- Quick Action Bar -->
+    <section class="quick-actions card">
+      <h3>⚡ Instant Job Generators</h3>
+      <div class="actions-row">
+        <button class="btn btn-action" onclick="submitQuickJob('EMAIL', 'MEDIUM')">
+          ✉️ Send Email (Med)
+        </button>
+        <button class="btn btn-action" onclick="submitQuickJob('REPORT_GENERATION', 'LOW')">
+          📊 PDF Report (Low)
+        </button>
+        <button class="btn btn-action" onclick="submitQuickJob('IMAGE_RESIZE', 'HIGH')">
+          🖼️ Image Resize (High)
+        </button>
+        <button class="btn btn-action btn-warn" onclick="submitQuickJob('FAILING_SIMULATION', 'MEDIUM')">
+          ⚠️ Failing Job (Test Retries)
+        </button>
+        <button class="btn btn-primary" onclick="simulateBurst(30)">
+          🔥 Simulate 30-Job Burst
+        </button>
+      </div>
+    </section>
+
+    <!-- Main Content Area: Submission Form + Live Stream -->
+    <div class="main-layout">
+      <!-- Submission Card -->
+      <div class="card form-card">
+        <h3>📝 Submit Custom Job</h3>
+        <form id="jobForm">
+          <div class="form-group">
+            <label for="jobType">Job Type</label>
+            <select id="jobType" class="form-control">
+              <option value="EMAIL">EMAIL</option>
+              <option value="REPORT_GENERATION">REPORT_GENERATION</option>
+              <option value="IMAGE_RESIZE">IMAGE_RESIZE</option>
+              <option value="WEBHOOK_DISPATCH">WEBHOOK_DISPATCH</option>
+              <option value="FAILING_SIMULATION">FAILING_SIMULATION</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="jobPriority">Priority Tier</label>
+            <select id="jobPriority" class="form-control">
+              <option value="HIGH">HIGH (Processed First)</option>
+              <option value="MEDIUM" selected>MEDIUM (Standard)</option>
+              <option value="LOW">LOW (Background Batch)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="maxRetries">Max Retries</label>
+            <input type="number" id="maxRetries" class="form-control" value="3" min="0" max="10" />
+          </div>
+
+          <div class="form-group">
+            <label for="jobPayload">JSON Payload</label>
+            <textarea id="jobPayload" class="form-control code-font" rows="5">{
+  "to": "user@example.com",
+  "subject": "System Alert",
+  "template": "welcome_email"
+}</textarea>
+          </div>
+
+          <button type="submit" class="btn btn-primary btn-block">🚀 Enqueue Job</button>
+        </form>
+      </div>
+
+      <!-- Live Job Stream -->
+      <div class="card table-card">
+        <div class="table-header">
+          <h3>📋 Live Job Queue Stream</h3>
+          <div class="filter-group">
+            <select id="filterStatus" class="form-control select-sm">
+              <option value="">All Statuses</option>
+              <option value="PENDING">PENDING</option>
+              <option value="PROCESSING">PROCESSING</option>
+              <option value="COMPLETED">COMPLETED</option>
+              <option value="RETRYING">RETRYING</option>
+              <option value="FAILED">FAILED</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Job ID</th>
+                <th>Type</th>
+                <th>Priority</th>
+                <th>Status</th>
+                <th>Attempts</th>
+                <th>Duration</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="jobTableBody">
+              <tr>
+                <td colspan="7" class="text-center text-muted">Loading queue data...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

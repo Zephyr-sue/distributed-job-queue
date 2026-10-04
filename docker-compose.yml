@@ -1,0 +1,87 @@
+﻿version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: djq_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:6-jammy
+    container_name: djq_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: djq_api
+    command: node src/api/server.js
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGO_URI=mongodb://mongodb:27017/job_queue_db
+      - ENABLE_IN_MEMORY_FALLBACK=false
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-1:
+    build: .
+    container_name: djq_worker_1
+    command: node src/worker/worker.js
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGO_URI=mongodb://mongodb:27017/job_queue_db
+      - ENABLE_IN_MEMORY_FALLBACK=false
+      - WORKER_CONCURRENCY=5
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-2:
+    build: .
+    container_name: djq_worker_2
+    command: node src/worker/worker.js
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGO_URI=mongodb://mongodb:27017/job_queue_db
+      - ENABLE_IN_MEMORY_FALLBACK=false
+      - WORKER_CONCURRENCY=5
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  mongo_data:
