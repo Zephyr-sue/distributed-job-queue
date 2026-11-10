@@ -1,9 +1,10 @@
-﻿const JOB_STATUS = Object.freeze({
+const JOB_STATUS = Object.freeze({
   PENDING: 'PENDING',
   PROCESSING: 'PROCESSING',
   COMPLETED: 'COMPLETED',
   FAILED: 'FAILED',
   RETRYING: 'RETRYING',
+  DLQ: 'DLQ',
 });
 
 const JOB_PRIORITY = Object.freeze({
@@ -26,6 +27,12 @@ const QUEUE_KEYS = Object.freeze({
   LOW: 'queue:jobs:LOW',
   DELAYED: 'zset:jobs:delayed',
   PROCESSING: 'set:jobs:processing',
+  DLQ: 'queue:jobs:DLQ',
+  ACTIVE_WORKERS: 'workers:active',
+  workerProcessingQueue: (workerId) => `queue:jobs:processing:${workerId}`,
+  workerHeartbeat: (workerId) => `worker:heartbeat:${workerId}`,
+  jobLock: (jobId) => `lock:job:${jobId}`,
+  idempotency: (key) => `idempotency:${key}`,
 });
 
 module.exports = {

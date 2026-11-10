@@ -1,12 +1,19 @@
-﻿const { QUEUE_KEYS, JOB_PRIORITY } = require('./constants');
+const { QUEUE_KEYS, JOB_PRIORITY } = require('./constants');
 const { createRedisClient } = require('./redis');
+const config = require('../config');
 
 class JobQueue {
-  constructor() {
+  constructor(options = {}) {
+    this.keyPrefix = typeof options === 'string' ? options : (options.keyPrefix || '');
     this.client = null;
     this.blockingClient = null;
     this.isInitialized = false;
     this.promoterTimer = null;
+    this.reaperTimer = null;
+  }
+
+  _k(key) {
+    return this.keyPrefix ? `${this.keyPrefix}:${key}` : key;
   }
 
   async init(label = 'main') {
@@ -18,15 +25,20 @@ class JobQueue {
   }
 
   getQueueKeyByPriority(priority) {
+    let key;
     switch (priority) {
       case JOB_PRIORITY.HIGH:
-        return QUEUE_KEYS.HIGH;
+        key = QUEUE_KEYS.HIGH;
+        break;
       case JOB_PRIORITY.LOW:
-        return QUEUE_KEYS.LOW;
+        key = QUEUE_KEYS.LOW;
+        break;
       case JOB_PRIORITY.MEDIUM:
       default:
-        return QUEUE_KEYS.MEDIUM;
+        key = QUEUE_KEYS.MEDIUM;
+        break;
     }
+    return this._k(key);
   }
 
   /**
@@ -35,58 +47,210 @@ class JobQueue {
   async enqueue(jobId, priority = JOB_PRIORITY.MEDIUM) {
     if (!this.isInitialized) await this.init();
     const queueKey = this.getQueueKeyByPriority(priority);
-    // LPUSH pushes to head; workers BRPOP from tail (FIFO within priority tier)
     await this.client.lpush(queueKey, jobId);
     return { queueKey, jobId, priority };
   }
 
   /**
-   * Atomically fetch the highest priority available job
-   * Uses Redis BRPOP queue:HIGH queue:MEDIUM queue:LOW
-   * Redis checks keys strictly in the provided order!
+   * Atomic move helper (BLMOVE with fallback to BRPOPLPUSH or LMOVE)
    */
-  async fetchNext(timeoutSec = 2) {
+  async _atomicMove(source, destination, timeoutSec = 0) {
+    try {
+      if (typeof this.blockingClient.blmove === 'function' && timeoutSec > 0) {
+        return await this.blockingClient.blmove(source, destination, 'RIGHT', 'LEFT', timeoutSec);
+      }
+      if (typeof this.client.lmove === 'function' && timeoutSec === 0) {
+        return await this.client.lmove(source, destination, 'RIGHT', 'LEFT');
+      }
+    } catch (err) {
+      // Fallback for older Redis or clients without BLMOVE
+    }
+
+    if (timeoutSec > 0 && typeof this.blockingClient.brpoplpush === 'function') {
+      return await this.blockingClient.brpoplpush(source, destination, timeoutSec);
+    }
+    if (typeof this.client.rpoplpush === 'function') {
+      return await this.client.rpoplpush(source, destination);
+    }
+
+    return null;
+  }
+
+  /**
+   * Atomically fetch the highest priority available job using BLMOVE/RPOPLPUSH.
+   * Jobs are moved into worker-specific in-flight processing queue.
+   */
+  async fetchNext(workerId = 'default-worker', timeoutSec = 2) {
     if (!this.isInitialized) await this.init();
-    
-    // Priority order: HIGH -> MEDIUM -> LOW
-    const result = await this.blockingClient.brpop(
-      QUEUE_KEYS.HIGH,
-      QUEUE_KEYS.MEDIUM,
-      QUEUE_KEYS.LOW,
-      timeoutSec
-    );
 
-    if (!result) return null;
+    const processingQueue = this._k(QUEUE_KEYS.workerProcessingQueue(workerId));
+    const highKey = this._k(QUEUE_KEYS.HIGH);
+    const medKey = this._k(QUEUE_KEYS.MEDIUM);
+    const lowKey = this._k(QUEUE_KEYS.LOW);
 
-    const [queueKey, jobId] = result;
-    let priority = JOB_PRIORITY.MEDIUM;
-    if (queueKey === QUEUE_KEYS.HIGH) priority = JOB_PRIORITY.HIGH;
-    if (queueKey === QUEUE_KEYS.LOW) priority = JOB_PRIORITY.LOW;
+    // 1. Try non-blocking atomic move in priority order: HIGH -> MEDIUM -> LOW
+    let jobId = await this._atomicMove(highKey, processingQueue, 0);
+    let priority = JOB_PRIORITY.HIGH;
 
-    // Track as actively in-flight
-    await this.client.sadd(QUEUE_KEYS.PROCESSING, jobId);
+    if (!jobId) {
+      jobId = await this._atomicMove(medKey, processingQueue, 0);
+      priority = JOB_PRIORITY.MEDIUM;
+    }
 
-    return { jobId, priority, queueKey };
+    if (!jobId) {
+      jobId = await this._atomicMove(lowKey, processingQueue, 0);
+      priority = JOB_PRIORITY.LOW;
+    }
+
+    // 2. If nothing ready, block for up to timeoutSec on HIGH queue
+    if (!jobId && timeoutSec > 0) {
+      jobId = await this._atomicMove(highKey, processingQueue, timeoutSec);
+      priority = JOB_PRIORITY.HIGH;
+    }
+
+    if (!jobId) return null;
+
+    // Track in global processing set for monitoring
+    await this.client.sadd(this._k(QUEUE_KEYS.PROCESSING), jobId);
+
+    return { jobId, priority, workerProcessingQueue: processingQueue };
   }
 
   /**
    * Schedule a job for delayed retry using Redis Sorted Set (ZSET)
    */
-  async scheduleRetry(jobId, priority, delayMs) {
+  async scheduleRetry(jobId, priority, delayMs, workerId = null) {
     if (!this.isInitialized) await this.init();
     const runAt = Date.now() + delayMs;
     const member = JSON.stringify({ jobId, priority });
-    await this.client.zadd(QUEUE_KEYS.DELAYED, runAt, member);
-    await this.client.srem(QUEUE_KEYS.PROCESSING, jobId);
+
+    await this.client.zadd(this._k(QUEUE_KEYS.DELAYED), runAt, member);
+    await this.client.srem(this._k(QUEUE_KEYS.PROCESSING), jobId);
+
+    if (workerId) {
+      await this.client.lrem(this._k(QUEUE_KEYS.workerProcessingQueue(workerId)), 0, jobId);
+    }
+
     return { jobId, runAt };
   }
 
   /**
-   * Mark job as finished processing
+   * Move a permanently failed job into Dead Letter Queue (DLQ)
    */
-  async ackJob(jobId) {
+  async moveToDLQ(jobId, workerId = null) {
     if (!this.isInitialized) await this.init();
-    await this.client.srem(QUEUE_KEYS.PROCESSING, jobId);
+
+    await this.client.lpush(this._k(QUEUE_KEYS.DLQ), jobId);
+    await this.client.srem(this._k(QUEUE_KEYS.PROCESSING), jobId);
+
+    if (workerId) {
+      await this.client.lrem(this._k(QUEUE_KEYS.workerProcessingQueue(workerId)), 0, jobId);
+    }
+
+    return { jobId, dlq: this._k(QUEUE_KEYS.DLQ) };
+  }
+
+  /**
+   * Mark job as finished processing and clean up in-flight queues
+   */
+  async ackJob(jobId, workerId = null) {
+    if (!this.isInitialized) await this.init();
+    await this.client.srem(this._k(QUEUE_KEYS.PROCESSING), jobId);
+    if (workerId) {
+      await this.client.lrem(this._k(QUEUE_KEYS.workerProcessingQueue(workerId)), 0, jobId);
+    }
+  }
+
+  /**
+   * Worker heartbeat & presence registration
+   */
+  async recordHeartbeat(workerId, ttlSec = 10) {
+    if (!this.isInitialized) await this.init();
+    await this.client.set(this._k(QUEUE_KEYS.workerHeartbeat(workerId)), Date.now(), 'EX', ttlSec);
+    await this.client.sadd(this._k(QUEUE_KEYS.ACTIVE_WORKERS), workerId);
+  }
+
+  async unregisterWorker(workerId) {
+    if (!this.isInitialized) await this.init();
+    await this.client.del(this._k(QUEUE_KEYS.workerHeartbeat(workerId)));
+    await this.client.srem(this._k(QUEUE_KEYS.ACTIVE_WORKERS), workerId);
+  }
+
+  /**
+   * Acquire atomic distributed lock for idempotency guard (SET NX EX)
+   */
+  async acquireJobLock(jobId, workerId, ttlSec = 60) {
+    if (!this.isInitialized) await this.init();
+    const lockKey = this._k(QUEUE_KEYS.jobLock(jobId));
+    const result = await this.client.set(lockKey, workerId, 'NX', 'EX', ttlSec);
+    return result === 'OK';
+  }
+
+  async releaseJobLock(jobId) {
+    if (!this.isInitialized) await this.init();
+    await this.client.del(this._k(QUEUE_KEYS.jobLock(jobId)));
+  }
+
+  /**
+   * Check or set API-level idempotency key
+   */
+  async checkOrSetIdempotencyKey(key, jobId, ttlSec = 86400) {
+    if (!this.isInitialized) await this.init();
+    const redisKey = this._k(QUEUE_KEYS.idempotency(key));
+    const result = await this.client.set(redisKey, jobId, 'NX', 'EX', ttlSec);
+    if (result === 'OK') {
+      return { isNew: true, jobId };
+    }
+    const existingJobId = await this.client.get(redisKey);
+    return { isNew: false, jobId: existingJobId };
+  }
+
+  /**
+   * Orphan Job Reaper Daemon:
+   * Inspects all active workers. If worker heartbeat expired, reclaims in-flight jobs
+   * and pushes them back to HIGH priority queue to ensure at-least-once delivery.
+   */
+  async reapOrphanedJobs() {
+    if (!this.isInitialized) await this.init();
+    const activeWorkers = await this.client.smembers(this._k(QUEUE_KEYS.ACTIVE_WORKERS));
+    const reapedJobs = [];
+
+    for (const workerId of activeWorkers) {
+      const hasHeartbeat = await this.client.exists(this._k(QUEUE_KEYS.workerHeartbeat(workerId)));
+      if (!hasHeartbeat) {
+        const workerQueue = this._k(QUEUE_KEYS.workerProcessingQueue(workerId));
+        const strandedJobs = await this.client.lrange(workerQueue, 0, -1);
+
+        if (strandedJobs && strandedJobs.length > 0) {
+          console.warn(`[OrphanReaper] ⚠️ Worker ${workerId} is dead. Reclaiming ${strandedJobs.length} stranded job(s)...`);
+          for (const orphanId of strandedJobs) {
+            await this.client.lpush(this._k(QUEUE_KEYS.HIGH), orphanId);
+            reapedJobs.push({ workerId, jobId: orphanId });
+          }
+        }
+
+        await this.client.del(workerQueue);
+        await this.client.srem(this._k(QUEUE_KEYS.ACTIVE_WORKERS), workerId);
+      }
+    }
+
+    return reapedJobs;
+  }
+
+  startOrphanReaper(intervalMs = 5000) {
+    if (this.reaperTimer) return;
+
+    this.reaperTimer = setInterval(async () => {
+      try {
+        await this.reapOrphanedJobs();
+      } catch (err) {
+        // Silent catch for reaper loop
+      }
+    }, intervalMs);
+
+    if (this.reaperTimer.unref) {
+      this.reaperTimer.unref();
+    }
   }
 
   /**
@@ -99,12 +263,10 @@ class JobQueue {
     this.promoterTimer = setInterval(async () => {
       try {
         const now = Date.now();
-        // Get due jobs
-        const dueMembers = await this.client.zrangebyscore(QUEUE_KEYS.DELAYED, 0, now);
+        const dueMembers = await this.client.zrangebyscore(this._k(QUEUE_KEYS.DELAYED), 0, now);
 
         for (const member of dueMembers) {
-          // Remove from ZSET first to prevent double-processing
-          const removed = await this.client.zrem(QUEUE_KEYS.DELAYED, member);
+          const removed = await this.client.zrem(this._k(QUEUE_KEYS.DELAYED), member);
           if (removed) {
             const { jobId, priority } = JSON.parse(member);
             const queueKey = this.getQueueKeyByPriority(priority);
@@ -122,16 +284,33 @@ class JobQueue {
   }
 
   /**
+   * Replay DLQ jobs back into HIGH queue
+   */
+  async replayDLQ(limit = 100) {
+    if (!this.isInitialized) await this.init();
+    const replayed = [];
+    for (let i = 0; i < limit; i++) {
+      const jobId = await this.client.rpop(this._k(QUEUE_KEYS.DLQ));
+      if (!jobId) break;
+      await this.client.lpush(this._k(QUEUE_KEYS.HIGH), jobId);
+      replayed.push(jobId);
+    }
+    return replayed;
+  }
+
+  /**
    * Fetch current lengths and metrics for all queues
    */
   async getMetrics() {
     if (!this.isInitialized) await this.init();
-    const [high, medium, low, delayed, processing] = await Promise.all([
-      this.client.llen(QUEUE_KEYS.HIGH),
-      this.client.llen(QUEUE_KEYS.MEDIUM),
-      this.client.llen(QUEUE_KEYS.LOW),
-      this.client.zcard(QUEUE_KEYS.DELAYED),
-      this.client.scard(QUEUE_KEYS.PROCESSING),
+    const [high, medium, low, delayed, processing, dlq, activeWorkers] = await Promise.all([
+      this.client.llen(this._k(QUEUE_KEYS.HIGH)),
+      this.client.llen(this._k(QUEUE_KEYS.MEDIUM)),
+      this.client.llen(this._k(QUEUE_KEYS.LOW)),
+      this.client.zcard(this._k(QUEUE_KEYS.DELAYED)),
+      this.client.scard(this._k(QUEUE_KEYS.PROCESSING)),
+      this.client.llen(this._k(QUEUE_KEYS.DLQ)),
+      this.client.scard(this._k(QUEUE_KEYS.ACTIVE_WORKERS)),
     ]);
 
     return {
@@ -141,18 +320,35 @@ class JobQueue {
       totalPending: high + medium + low,
       delayed,
       processing,
+      dlq,
+      activeWorkers,
     };
   }
 
   async clearAll() {
     if (!this.isInitialized) await this.init();
-    await this.client.flushall();
+    if (!this.keyPrefix) {
+      await this.client.flushall();
+    } else {
+      // Clear only keys matching prefix
+      const keysToDelete = [
+        this._k(QUEUE_KEYS.HIGH),
+        this._k(QUEUE_KEYS.MEDIUM),
+        this._k(QUEUE_KEYS.LOW),
+        this._k(QUEUE_KEYS.DELAYED),
+        this._k(QUEUE_KEYS.PROCESSING),
+        this._k(QUEUE_KEYS.DLQ),
+        this._k(QUEUE_KEYS.ACTIVE_WORKERS),
+      ];
+      await this.client.del(...keysToDelete);
+    }
   }
 
   async close() {
     if (this.promoterTimer) clearInterval(this.promoterTimer);
-    if (this.client) await this.client.quit();
-    if (this.blockingClient) await this.blockingClient.quit();
+    if (this.reaperTimer) clearInterval(this.reaperTimer);
+    if (this.client && typeof this.client.quit === 'function') await this.client.quit();
+    if (this.blockingClient && typeof this.blockingClient.quit === 'function') await this.blockingClient.quit();
     this.isInitialized = false;
   }
 }

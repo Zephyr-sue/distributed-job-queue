@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "distributed-job-queue",
   "version": "1.0.0",
   "description": "Production-grade distributed background job queue built with Node.js, Redis, MongoDB, and Docker",
@@ -10,6 +10,7 @@
     "start:workers": "node src/worker/workerPool.js",
     "dev:api": "node --watch src/api/server.js",
     "dev:worker": "node --watch src/worker/worker.js",
+    "test": "node test/system-reliability.test.js",
     "benchmark": "node scripts/benchmark.js",
     "seed": "node scripts/seedJobs.js"
   },

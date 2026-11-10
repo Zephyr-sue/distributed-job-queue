@@ -1,4 +1,4 @@
-﻿const mongoose = require('mongoose');
+const mongoose = require('mongoose');
 const { JOB_STATUS, JOB_PRIORITY, JOB_TYPES } = require('../queue/constants');
 const { isFallbackMode } = require('../database/mongo');
 
@@ -47,6 +47,12 @@ const jobSchema = new mongoose.Schema(
     workerId: {
       type: String,
       default: null,
+    },
+    idempotencyKey: {
+      type: String,
+      default: null,
+      sparse: true,
+      index: true,
     },
     result: {
       type: mongoose.Schema.Types.Mixed,
@@ -139,7 +145,7 @@ class InMemoryJobRepository {
     return { matchedCount: 1, modifiedCount: 1 };
   }
 
-  async find(filter = {}, options = {}) {
+  find(filter = {}, projectionOrOptions = {}, options = {}) {
     let list = Array.from(this.jobs.values());
     if (filter.status) {
       list = list.filter((j) => j.status === filter.status);
@@ -151,12 +157,31 @@ class InMemoryJobRepository {
       list = list.filter((j) => j.type === filter.type);
     }
 
-    // Sort descending by createdAt
     list.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
-    const skip = options.skip || 0;
-    const limit = options.limit || list.length;
-    return list.slice(skip, skip + limit).map((j) => JSON.parse(JSON.stringify(j)));
+    let skipVal = 0;
+    let limitVal = list.length;
+
+    const opts = options && (options.limit !== undefined || options.skip !== undefined)
+      ? options
+      : (projectionOrOptions || {});
+
+    if (opts.skip !== undefined) skipVal = opts.skip;
+    if (opts.limit !== undefined) limitVal = opts.limit;
+
+    const exec = () => list.slice(skipVal, skipVal + limitVal).map((j) => JSON.parse(JSON.stringify(j)));
+
+    const chain = {
+      sort: () => chain,
+      skip: (s) => { skipVal = s; return chain; },
+      limit: (l) => { limitVal = l; return chain; },
+      lean: () => chain,
+      then: (resolve, reject) => {
+        try { resolve(exec()); } catch (err) { reject(err); }
+      },
+    };
+
+    return chain;
   }
 
   async countDocuments(filter = {}) {
